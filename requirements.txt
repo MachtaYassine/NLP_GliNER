@@ -1,0 +1,4 @@
+gliner
+transformers
+datasets
+torch

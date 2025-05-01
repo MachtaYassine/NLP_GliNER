@@ -1,0 +1,6 @@
+# Directories
+logs/
+mlruns/
+model/
+results/
+data/
