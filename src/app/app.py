@@ -30,16 +30,15 @@ if task == "Entity Extraction (fast)":
     # Start loading multitask models in the background
     if not multitask_models_loaded.is_set():
         threading.Thread(target=background_load_multitask_models, daemon=True).start()
-# Comment out multitask model logic
-# if task == "Relations/Summarization (slower)":
-#     @st.cache_resource
-#     def load_multitask_models():
-#         model_id = 'knowledgator/gliner-multitask-v1.0'
-#         model = GLiNER.from_pretrained(model_id)
-#         relation_extractor = GLiNERRelationExtractor(model=model)
-#         summarizer = GLiNERSummarizer(model=model)
-#         return model, relation_extractor, summarizer
-#     model, relation_extractor, summarizer = load_multitask_models()
+else:
+    @st.cache_resource
+    def load_multitask_models():
+        model_id = 'knowledgator/gliner-multitask-v1.0'
+        model = GLiNER.from_pretrained(model_id)
+        relation_extractor = GLiNERRelationExtractor(model=model)
+        summarizer = GLiNERSummarizer(model=model)
+        return model, relation_extractor, summarizer
+    model, relation_extractor, summarizer = load_multitask_models()
 
 # Preset options for entity and relation types
 presets = {
@@ -96,15 +95,15 @@ def smart_split_text(text, max_chunk_len=1024):
         chunks.append(current_chunk)
     return chunks
 
-# In process_in_chunks, comment out multitask model logic
 def process_in_chunks(text, func, *args, **kwargs):
     """
     Process text in smart chunks, calling func(chunk, *args, **kwargs) for each chunk.
     Returns a list of results (one per chunk).
     For multitask models (no max length), process the whole text at once.
     """
-    # if task == "Relations/Summarization (slower)":
-    #     return [func(text, *args, **kwargs)]
+    if task == "Relations/Summarization (slower)":
+        # Multitask model: process whole text at once
+        return [func(text, *args, **kwargs)]
     # Otherwise, chunk for fast model
     chunks = smart_split_text(text)
     results = []
@@ -334,23 +333,82 @@ if task == "Entity Extraction (fast)":
                 st.info("No entities found.")
         else:
             st.warning("Please provide both text and entity types.")
-# In the UI, comment out multitask mode UI
-# else:
-#     entity_types = st.text_input("Enter entity types (comma-separated):", value=default_entities)
-#     relation_types = st.text_input("Enter relation types (comma-separated):", value=default_relations)
-#     col1, col2, col3 = st.columns(3)
-#     with col1:
-#         extract_entities = st.button("Extract Entities (multitask)")
-#     with col2:
-#         extract_relations = st.button("Extract Relations")
-#     with col3:
-#         summarize = st.button("Summarize")
-#     if "extracted_entities" not in st.session_state:
-#         st.session_state["extracted_entities"] = []
-#     if extract_entities:
-#         ...existing code...
-#     if extract_relations:
-#         ...existing code...
-#     if summarize:
-#         ...existing code...
-# ...existing code...
+else:
+    entity_types = st.text_input("Enter entity types (comma-separated):", value=default_entities)
+    relation_types = st.text_input("Enter relation types (comma-separated):", value=default_relations)
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        extract_entities = st.button("Extract Entities (multitask)")
+    with col2:
+        extract_relations = st.button("Extract Relations")
+    with col3:
+        summarize = st.button("Summarize")
+    if "extracted_entities" not in st.session_state:
+        st.session_state["extracted_entities"] = []
+    if extract_entities:
+        if text.strip() and entity_types.strip():
+            entity_list = [e.strip() for e in entity_types.split(",") if e.strip()]
+            # Process in chunks
+            chunk_results = process_in_chunks(text, model.predict_entities, entity_list)
+            ents = [ent for chunk in chunk_results for ent in chunk]
+            # Deduplicate using majority voting
+            unique_entities = deduplicate_entities_majority_voting(ents)
+            # Refine entity list
+            unique_entities = refine_entity_list(unique_entities, text)
+            st.session_state["extracted_entities"] = unique_entities
+            st.write("### Entities")
+            for ent in unique_entities:
+                st.write(f"**{ent['text']}**  ➔  `{ent['label']}`")
+            entity_contexts = get_entity_contexts(text, unique_entities)
+            descriptions = get_entity_descriptions(entity_contexts)
+            st.write("### Entity Descriptions (QA-based)")
+            for ent in unique_entities:
+                desc = descriptions.get(ent['text'], '')
+                if desc:
+                    st.write(f"**{ent['text']}**: {desc}")
+            # Extract relations between entities in the same sentence
+            relations = get_sentence_relations(unique_entities, text, qa_pipeline)
+            # Filter relations before displaying
+            relations = filter_relations(relations, unique_entities)
+            if relations:
+                st.write("### Relations between Entities (QA-based)")
+                for rel in relations:
+                    st.write(f"`{rel['entity1']}` --**{rel['relation']}**--> `{rel['entity2']}` (in: _{rel['sentence']}_)")
+        else:
+            st.warning("Please provide text and entity types.")
+    if extract_relations:
+        if text.strip() and relation_types.strip():
+            ents = st.session_state.get("extracted_entities", [])
+            if not ents:
+                st.warning("Please extract entities first.")
+            else:
+                relation_list = [r.strip() for r in relation_types.split(",") if r.strip()]
+                entity_labels = list(set([ent['label'] for ent in ents]))
+                # Process in chunks
+                chunk_results = process_in_chunks(text, relation_extractor, entity_labels, relation_list)
+                # Aggregate relations
+                rels = []
+                for chunk in chunk_results:
+                    if isinstance(chunk, dict):
+                        rels.extend(chunk.get('relations', []))
+                if rels:
+                    st.write("### Relations")
+                    for rel in rels:
+                        subj = rel['head']['text']
+                        obj = rel['tail']['text']
+                        rel_type = rel['type']
+                        st.write(f"`{subj}` --**{rel_type}**--> `{obj}`")
+                else:
+                    st.info("No relations found.")
+        else:
+            st.warning("Please provide text and relation types.")
+    if summarize:
+        if text.strip():
+            # Process in chunks
+            chunk_results = process_in_chunks(text, summarizer, threshold=0.1)
+            # Join summaries
+            summary = '\n'.join([str(chunk) for chunk in chunk_results])
+            st.write("### Summary")
+            st.write(summary)
+        else:
+            st.warning("Please provide text to summarize.")
