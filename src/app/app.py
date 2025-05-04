@@ -207,26 +207,71 @@ def are_entities_equivalent(entity1, entity2, context):
         pass
     return False
 
+import time
 def refine_entity_list(entities, text):
     """
     Refine the entity list by merging entities that refer to the same thing using Mistral LLM.
+    Shows a progress bar in both the console and the Streamlit app.
+    Also computes relations and entity descriptions in the same pass to minimize Mistral queries.
+    Times each Mistral query for performance insight.
     """
     merged = []
     used = set()
+    total = len(entities)
+    st_progress = st.progress(0, text="Refining entity list...")
+    relations = []
+    entity_descriptions = {}
     for i, ent1 in enumerate(entities):
         if ent1['text'] in used:
+            st_progress.progress((i+1)/total, text=f"Refining entity {i+1}/{total}")
+            print(f"Skipping {ent1['text']} (already used) [{i+1}/{total}]")
             continue
         group = [ent1['text']]
+        # Compute entity description here
+        context_sentences = [sent for sent in re.split(r'(?<=[.!?])\s+', text) if ent1['text'] in sent]
+        context = ' '.join(context_sentences)
+        question = (
+            f"Based on the following text, provide a detailed and clear description of '{ent1['text']}'. "
+            f"Include their role, characteristics (physical or moral), and any important relationships or actions. "
+            f"If '{ent1['text']}' is a place or object, describe its significance or function."
+        )
+        print(f"Prompting Mistral for entity: {ent1['text']}")  # DEBUG
+        try:
+            desc = mistral_qa(question, context)
+            print(f"{ent1['text']}: {desc}")  # DEBUG
+        except Exception as e:
+            desc = f"[Error: {e}]"
+            print(f"{ent1['text']}: {desc}")  # DEBUG
+        entity_descriptions[ent1['text']] = desc
         for j, ent2 in enumerate(entities):
             if i != j and ent2['text'] not in used:
-                # Use a small context window for efficiency
                 context = text
-                if are_entities_equivalent(ent1['text'], ent2['text'], context):
+                print(f"Comparing '{ent1['text']}' and '{ent2['text']}' [{i+1}/{total}]")
+                start_time = time.time()
+                equivalent = are_entities_equivalent(ent1['text'], ent2['text'], context)
+                elapsed = time.time() - start_time
+                print(f"Mistral query for equivalence took {elapsed:.2f} seconds.")
+                if equivalent:
+                    print(f"  -> Merged '{ent2['text']}' with '{ent1['text']}'")
                     group.append(ent2['text'])
                     used.add(ent2['text'])
+                else:
+                    # Compute relation right away
+                    rel_question = f"What is the relationship between {ent1['text']} and {ent2['text']}?"
+                    rel_context = RELATION_TYPE_CONTEXT + "\n" + context
+                    rel_start = time.time()
+                    rel_answer = mistral_qa(rel_question, rel_context)
+                    rel_elapsed = time.time() - rel_start
+                    print(f"Mistral query for relation took {rel_elapsed:.2f} seconds.")
+                    if rel_answer and rel_answer.lower() not in [ent1['text'].lower(), ent2['text'].lower(), 'no', 'none', 'unknown'] and len(rel_answer.split()) > 1:
+                        relations.append({'entity1': ent1['text'], 'entity2': ent2['text'], 'relation': rel_answer, 'sentence': context})
         merged.append({'text': '/'.join(group), 'label': ent1['label']})
         used.update(group)
-    return merged
+        st_progress.progress((i+1)/total, text=f"Refining entity {i+1}/{total}")
+    st_progress.empty()
+    print("Entity refinement complete.")
+    print(f"Relations computed during refinement: {relations}")
+    return merged, relations, entity_descriptions
 
 # Define a set of relation types for historical/fiction settings
 RELATION_TYPE_CONTEXT = """
@@ -296,43 +341,214 @@ else:
     default_entities = "person, company, year"
     default_relations = "founded, owns, works for"
 
+def batch_mistral_qa(prompts):
+    """
+    Given a list of (prompt, context) tuples, send them as a batch to Mistral (if supported),
+    otherwise process sequentially. Returns a list of responses.
+    """
+    responses = []
+    for prompt, context in prompts:
+        full_prompt = f"Context:\n{context}\n\nQuestion: {prompt}\nAnswer:"
+        chat_response = mistral_client.chat.complete(
+            model=mistral_model,
+            messages=[
+                {
+                    "role": "user",
+                    "content": full_prompt,
+                },
+            ]
+        )
+        responses.append(chat_response.choices[0].message.content.strip())
+    return responses
+
+def efficient_entity_processing(entities, text):
+    """
+    For a list of entities, deduplicate, get descriptions, and compute relations with minimal Mistral calls.
+    """
+    entity_texts = [e['text'] for e in entities]
+    n = len(entity_texts)
+    # 1. Prepare all entity pairs for equivalence and relation checks
+    pair_prompts = []
+    pair_indices = []
+    for i, ent1 in enumerate(entity_texts):
+        for j, ent2 in enumerate(entity_texts):
+            if i < j:
+                eq_prompt = f"Are '{ent1}' and '{ent2}' referring to the same entity in the following context? If yes, answer 'yes' and explain why. If not, answer 'no' and explain why."
+                pair_prompts.append((eq_prompt, text))
+                pair_indices.append((i, j))
+    # 2. Prepare all entity descriptions
+    desc_prompts = []
+    for ent in entity_texts:
+        context_sentences = [sent for sent in re.split(r'(?<=[.!?])\s+', text) if ent in sent]
+        context = ' '.join(context_sentences)
+        desc_prompt = (
+            f"Based on the following text, provide a detailed and clear description of '{ent}'. "
+            f"Include their role, characteristics (physical or moral), and any important relationships or actions. "
+            f"If '{ent}' is a place or object, describe its significance or function."
+        )
+        desc_prompts.append((desc_prompt, context))
+    # 3. Run all equivalence prompts
+    print(f"Running {len(pair_prompts)} equivalence checks...")
+    eq_results = batch_mistral_qa(pair_prompts)
+    # 4. Deduplicate entities based on equivalence
+    groups = []
+    used = set()
+    eq_matrix = [[False]*n for _ in range(n)]
+    for idx, (i, j) in enumerate(pair_indices):
+        eq_matrix[i][j] = eq_results[idx].lower().startswith('yes')
+        eq_matrix[j][i] = eq_matrix[i][j]
+    for i in range(n):
+        if entity_texts[i] in used:
+            continue
+        group = [entity_texts[i]]
+        for j in range(i+1, n):
+            if eq_matrix[i][j]:
+                group.append(entity_texts[j])
+                used.add(entity_texts[j])
+        groups.append(group)
+        used.update(group)
+    merged = [{'text': '/'.join(group), 'label': entities[entity_texts.index(group[0])]['label']} for group in groups]
+    # 5. Run all descriptions
+    print(f"Running {len(desc_prompts)} description queries...")
+    desc_results = batch_mistral_qa(desc_prompts)
+    entity_descriptions = {ent: desc for ent, desc in zip(entity_texts, desc_results)}
+    # 6. Prepare and run relation prompts for non-equivalent pairs
+    rel_prompts = []
+    rel_indices = []
+    for idx, (i, j) in enumerate(pair_indices):
+        if not eq_matrix[i][j]:
+            rel_question = f"What is the relationship between {entity_texts[i]} and {entity_texts[j]}?"
+            rel_context = RELATION_TYPE_CONTEXT + "\n" + text
+            rel_prompts.append((rel_question, rel_context))
+            rel_indices.append((i, j))
+    print(f"Running {len(rel_prompts)} relation queries...")
+    rel_results = batch_mistral_qa(rel_prompts)
+    relations = []
+    for (i, j), rel_answer in zip(rel_indices, rel_results):
+        if rel_answer and rel_answer.lower() not in [entity_texts[i].lower(), entity_texts[j].lower(), 'no', 'none', 'unknown'] and len(rel_answer.split()) > 1:
+            relations.append({'entity1': entity_texts[i], 'entity2': entity_texts[j], 'relation': rel_answer, 'sentence': text})
+    print("Entity refinement and relation extraction complete.")
+    print(f"Relations computed: {relations}")
+    return merged, relations, entity_descriptions
+
+def mistral_deduplicate_entities(entities, context):
+    """
+    Call Mistral to deduplicate entities. Returns a list of dicts: {"texts": [aliases], "label": label}
+    """
+    entity_list = [f"{e['text']} ({e['label']})" for e in entities]
+    prompt = (
+        "Given the following list of entities and the context, group together entities that refer to the same thing. "
+        "Return a JSON list of objects, each with 'texts' (list of synonyms/aliases) and 'label' (entity type).\n"
+        "Example output: [{\"texts\": [\"John\", \"Mr. Smith\"], \"label\": \"person\"}, ...]\n"
+        f"Entities: {entity_list}\n"
+        f"Context: {context}"
+    )
+    print(f'prompt deduplication: {prompt}')  # DEBUG
+    response = mistral_client.chat.complete(
+        model=mistral_model,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    import json
+    try:
+        deduped = json.loads(response.choices[0].message.content)
+    except Exception:
+        deduped = []
+    return deduped
+
+def mistral_describe_entities(deduped_entities, context):
+    """
+    Call Mistral to generate descriptions for each deduped entity group.
+    Returns a list of dicts: {"texts": [...], "description": "..."}
+    """
+    prompt = (
+        "For each entity group below, provide a detailed description based on the context. "
+        "Return a JSON list of {\"texts\": [...], \"description\": \"...\"}.\n"
+        f"Entities: {deduped_entities}\n"
+        f"Context: {context}"
+    )
+    print(f'prompt description: {prompt}')  # DEBUG
+    response = mistral_client.chat.complete(
+        model=mistral_model,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    import json
+    try:
+        descriptions = json.loads(response.choices[0].message.content)
+    except Exception:
+        descriptions = []
+    return descriptions
+
+def mistral_entity_relations(deduped_entities, context):
+    """
+    Call Mistral to extract relations between deduped entities.
+    Returns a list of dicts: {"entity1": "...", "entity2": "...", "relation": "...", "sentence": "..."}
+    """
+    prompt = (
+        "For the following entities, list all meaningful relations between them found in the context. "
+        "Return a JSON list of {\"entity1\": \"...\", \"entity2\": \"...\", \"relation\": \"...\", \"sentence\": \"...\"}.\n"
+        f"Entities: {deduped_entities}\n"
+        f"Context: {context}"
+    )
+    print(f'prompt relations: {prompt}')  # DEBUG
+    response = mistral_client.chat.complete(
+        model=mistral_model,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    import json
+    try:
+        relations = json.loads(response.choices[0].message.content)
+    except Exception:
+        relations = []
+    return relations
+
 if task == "Entity Extraction (fast)":
+    print("Entered fast entity extraction task")  # DEBUG
     labels = st.text_input("Enter entity types (comma-separated):", value=default_entities)
     threshold = st.slider("Prediction threshold", 0.0, 1.0, 0.5, 0.01)
     if st.button("Extract Entities"):
+        print("Extract Entities button pressed")  # DEBUG
         if text.strip() and labels.strip():
+            print("Text and labels are not empty")  # DEBUG
             label_list = [l.strip() for l in labels.split(",") if l.strip()]
             # Process in chunks
+            print("Calling process_in_chunks")  # DEBUG
             chunk_results = process_in_chunks(text, model.predict_entities, label_list, threshold=threshold)
+            print("process_in_chunks finished")  # DEBUG
             # Flatten all entities
             entities = [ent for chunk in chunk_results for ent in chunk]
+            print(f"Entities found: {entities}")  # DEBUG
             # Deduplicate using majority voting
             unique_entities = deduplicate_entities_majority_voting(entities)
+            print(f"Unique entities after deduplication: {unique_entities}")  # DEBUG
             if unique_entities:
                 st.write("### Extracted Entities")
                 for entity in unique_entities:
                     st.write(f"**{entity['text']}**  ➔  `{entity['label']}`")
-                # Only call Mistral after displaying entities
-                # Refine entity list
-                unique_entities = refine_entity_list(unique_entities, text)
-                entity_contexts = get_entity_contexts(text, unique_entities)
-                descriptions = get_entity_descriptions(entity_contexts)
-                st.write("### Entity Descriptions (QA-based)")
-                for ent in unique_entities:
-                    desc = descriptions.get(ent['text'], '')
-                    if desc:
-                        st.write(f"**{ent['text']}**: {desc}")
-                # Extract relations between entities in the same sentence
-                relations = get_sentence_relations(unique_entities, text, qa_pipeline)
-                # Filter relations before displaying
-                relations = filter_relations(relations, unique_entities)
-                if relations:
-                    st.write("### Relations between Entities (QA-based)")
-                    for rel in relations:
-                        st.write(f"`{rel['entity1']}` --**{rel['relation']}**--> `{rel['entity2']}` (in: _{rel['sentence']}_)")
+                print("[PROGRESS] Printed extracted entities. Proceeding to deduplication...")
+                # --- 3 Mistral calls ---
+                st.write("\n---\n### Entity Groups (Deduplicated)")
+                deduped = mistral_deduplicate_entities(unique_entities, text)
+                print(f"Deduped entities: {deduped}")  # DEBUG
+                print("[PROGRESS] Deduplication complete. Proceeding to descriptions...")
+                for group in deduped:
+                    st.write(f"**{' / '.join(group['texts'])}**  ➔  `{group['label']}`")
+                st.write("\n---\n### Entity Descriptions")
+                descriptions = mistral_describe_entities(deduped, text)
+                print(f"Descriptions: {descriptions}")  # DEBUG
+                print("[PROGRESS] Descriptions complete. Proceeding to relations...")
+                for desc in descriptions:
+                    st.write(f"**{' / '.join(desc['texts'])}**: {desc['description']}")
+                st.write("\n---\n### Relations Between Entities")
+                relations = mistral_entity_relations(deduped, text)
+                print(f"Relations: {relations}")  # DEBUG
+                print("[PROGRESS] Relations extraction complete. Displaying results.")
+                for rel in relations:
+                    st.write(f"`{rel['entity1']}` --**{rel['relation']}**--> `{rel['entity2']}` (in: _{rel['sentence']}_)")
             else:
+                print("No entities found after deduplication")  # DEBUG
                 st.info("No entities found.")
         else:
+            print("Text or labels are empty")  # DEBUG
             st.warning("Please provide both text and entity types.")
 # In the UI, comment out multitask mode UI
 # else:
